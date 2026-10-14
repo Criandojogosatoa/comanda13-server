@@ -1,0 +1,8 @@
+{
+  "name": "comanda13-server",
+  "version": "1.0.0",
+  "description": "Servidor de salas do Comanda 13",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
