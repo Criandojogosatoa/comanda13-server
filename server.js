@@ -54,11 +54,6 @@ const bcast = (r, o, except) => r.players.forEach(p => { if (p !== except) send(
 
 function join(c, r) {
   r.players.set(c.id, c); c.room = r;
-  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r), tok: c.tok });
-  bcast(r, { t: 'join', id: c.id, name: c.name }, c);
-}
-function leave(c) {
-  const r = c.room; if (!r) return; c.room = null; clearTimeout(c.timer);
   if (r.players.get(c.id) !== c) return; // a vaga já foi retomada por uma reconexão
   r.players.delete(c.id);
   if (!r.players.size) return rooms.delete(r.code);
@@ -82,10 +77,25 @@ function takeover(c, r, old) {
   c.id = old.id; c.tok = old.tok; c.name = old.name; c.rc = true; c.room = r;
   r.players.set(c.id, c);
   try { old.sock.destroy(); } catch (e) {}
-  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r), tok: c.tok, re: 1 });
+  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r), tok: c.tok, re: 1, pub: r.pub ? 1 : 0 });
   bcast(r, { t: 'rj', id: c.id, name: c.name }, c);
 }
 function handle(c, m) {
+  // partida rápida: entra na sala pública mais cheia (mesma versão do jogo) que ainda tenha vaga;
+  // se não houver nenhuma, abre uma sala pública nova e espera os outros chegarem
+  if (m.t === 'quick') {
+    leave(c); c.name = String(m.name || 'Jogador').slice(0, 14); c.rc = !!m.rc;
+    const v = String(m.v || '').slice(0, 12);
+    let best = null, bn = 0;
+    rooms.forEach(r => {
+      if (!r.pub || r.v !== v || r.players.size >= MAX) return;
+      const n = [...r.players.values()].filter(p => !p.sock.destroyed).length; // só conta quem está conectado
+      if (n > bn) { best = r; bn = n; }
+    });
+    if (best) return join(c, best);
+    const r = { code: mkCode(), host: c.id, players: new Map(), pub: true, v };
+    rooms.set(r.code, r); return join(c, r);
+  }
   if (m.t === 'create' || m.t === 'join' || m.t === 'rejoin') {
     if (m.t === 'rejoin') {
       const r0 = rooms.get(String(m.code || '').toUpperCase().trim());
@@ -101,15 +111,3 @@ function handle(c, m) {
     if (r.players.size >= MAX) return send(c, { t: 'err', m: 'Sala cheia (máx. ' + MAX + ').' });
     return join(c, r);
   }
-  if (!c.room) return;
-  if (m.t === 's') return bcast(c.room, { t: 's', id: c.id, x: m.x, z: m.z, y: m.y, a: m.a, w: m.w }, c);
-  if (m.t === 'ev') return bcast(c.room, { t: 'ev', id: c.id, k: m.k, d: m.d }, c); // eventos genéricos (fase 2)
-  if (m.t === 'leave') leave(c);
-}
-// a cada 10 s: avisa que o servidor está vivo (heartbeat) e derruba conexões mudas
-setInterval(() => rooms.forEach(r => r.players.forEach(p => {
-  if (p.sock.destroyed) return;
-  if (p.rc && Date.now() - p.last > IDLE) return p.sock.destroy();
-  send(p, { t: 'p' });
-})), 10000);
-srv.listen(PORT, () => console.log('Comanda13 server na porta ' + PORT));
