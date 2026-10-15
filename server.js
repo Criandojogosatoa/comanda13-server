@@ -54,6 +54,10 @@ const bcast = (r, o, except) => r.players.forEach(p => { if (p !== except) send(
 
 function join(c, r) {
   r.players.set(c.id, c); c.room = r;
+  bcast(r, { t: 'join', id: c.id, name: c.name }, c);
+}
+function leave(c) {
+  const r = c.room; if (!r) return; c.room = null; clearTimeout(c.timer);
   if (r.players.get(c.id) !== c) return; // a vaga já foi retomada por uma reconexão
   r.players.delete(c.id);
   if (!r.players.size) return rooms.delete(r.code);
@@ -111,3 +115,15 @@ function handle(c, m) {
     if (r.players.size >= MAX) return send(c, { t: 'err', m: 'Sala cheia (máx. ' + MAX + ').' });
     return join(c, r);
   }
+  if (!c.room) return;
+  if (m.t === 's') return bcast(c.room, { t: 's', id: c.id, x: m.x, z: m.z, y: m.y, a: m.a, w: m.w }, c);
+  if (m.t === 'ev') return bcast(c.room, { t: 'ev', id: c.id, k: m.k, d: m.d }, c); // eventos genéricos (fase 2)
+  if (m.t === 'leave') leave(c);
+}
+// a cada 10 s: avisa que o servidor está vivo (heartbeat) e derruba conexões mudas
+setInterval(() => rooms.forEach(r => r.players.forEach(p => {
+  if (p.sock.destroyed) return;
+  if (p.rc && Date.now() - p.last > IDLE) return p.sock.destroy();
+  send(p, { t: 'p' });
+})), 10000);
+srv.listen(PORT, () => console.log('Comanda13 server na porta ' + PORT));
