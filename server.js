@@ -2,6 +2,8 @@
 // Uso: node server.js   (porta via variável PORT, padrão 8080)
 const http = require('http'), crypto = require('crypto');
 const PORT = process.env.PORT || 8080, MAX = 4;
+const GRACE = +process.env.GRACE_MS || 60000; // quanto tempo a vaga fica guardada depois que a conexão cai
+const IDLE = 45000; // sem receber nada por esse tempo = conexão morta (só para clientes com reconexão)
 const rooms = new Map(); // code -> {code, players: Map(id -> client)}
 let nextId = 1;
 
@@ -12,10 +14,11 @@ srv.on('upgrade', (req, sock) => {
   if (!key) return sock.destroy();
   const acc = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + acc + '\r\n\r\n');
-  const c = { sock, id: nextId++, name: 'Jogador', room: null, buf: Buffer.alloc(0), last: Date.now() };
+  const c = { sock, id: nextId++, name: 'Jogador', room: null, buf: Buffer.alloc(0), last: Date.now(),
+    tok: crypto.randomBytes(8).toString('hex'), rc: false, dead: false, timer: null };
   sock.setNoDelay(true);
-  sock.on('data', d => { c.buf = Buffer.concat([c.buf, d]); if (c.buf.length > 1 << 20) return sock.destroy(); parse(c); });
-  sock.on('close', () => leave(c));
+  sock.on('data', d => { c.last = Date.now(); c.buf = Buffer.concat([c.buf, d]); if (c.buf.length > 1 << 20) return sock.destroy(); parse(c); });
+  sock.on('close', () => lost(c));
   sock.on('error', () => sock.destroy());
 });
 
@@ -51,18 +54,47 @@ const bcast = (r, o, except) => r.players.forEach(p => { if (p !== except) send(
 
 function join(c, r) {
   r.players.set(c.id, c); c.room = r;
-  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r) });
+  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r), tok: c.tok });
   bcast(r, { t: 'join', id: c.id, name: c.name }, c);
 }
 function leave(c) {
-  const r = c.room; if (!r) return; c.room = null; r.players.delete(c.id);
+  const r = c.room; if (!r) return; c.room = null; clearTimeout(c.timer);
+  if (r.players.get(c.id) !== c) return; // a vaga já foi retomada por uma reconexão
+  r.players.delete(c.id);
   if (!r.players.size) return rooms.delete(r.code);
-  if (r.host === c.id) r.host = r.players.keys().next().value;
+  if (r.host === c.id) { // o novo anfitrião é alguém que está conectado de verdade
+    const vivo = [...r.players.values()].find(p => !p.sock.destroyed);
+    r.host = (vivo || r.players.values().next().value).id;
+  }
   bcast(r, { t: 'leave', id: c.id, host: r.host });
 }
+// a conexão caiu: quem sabe reconectar (rc) tem a vaga guardada por GRACE ms
+function lost(c) {
+  if (c.dead) return; c.dead = true;
+  const r = c.room; if (!r || r.players.get(c.id) !== c) return;
+  if (!c.rc) return leave(c);
+  c.timer = setTimeout(() => leave(c), GRACE);
+  bcast(r, { t: 'dc', id: c.id }, c);
+}
+// o jogador voltou com uma conexão nova: ela assume a vaga (mesmo id) da antiga
+function takeover(c, r, old) {
+  clearTimeout(old.timer); old.dead = true; old.room = null;
+  c.id = old.id; c.tok = old.tok; c.name = old.name; c.rc = true; c.room = r;
+  r.players.set(c.id, c);
+  try { old.sock.destroy(); } catch (e) {}
+  send(c, { t: 'room', code: r.code, id: c.id, host: r.host, players: list(r), tok: c.tok, re: 1 });
+  bcast(r, { t: 'rj', id: c.id, name: c.name }, c);
+}
 function handle(c, m) {
-  if (m.t === 'create' || m.t === 'join') {
-    leave(c); c.name = String(m.name || 'Jogador').slice(0, 14);
+  if (m.t === 'create' || m.t === 'join' || m.t === 'rejoin') {
+    if (m.t === 'rejoin') {
+      const r0 = rooms.get(String(m.code || '').toUpperCase().trim());
+      if (!r0) return send(c, { t: 'rjfail', why: 'room' });
+      const old = [...r0.players.values()].find(p => p.tok === String(m.tok || ''));
+      if (old && old !== c) return takeover(c, r0, old);
+      m = Object.assign({}, m, { t: 'join' }); // a vaga expirou, mas a sala existe: entra como jogador novo
+    }
+    leave(c); c.name = String(m.name || 'Jogador').slice(0, 14); c.rc = !!m.rc;
     if (m.t === 'create') { const r = { code: mkCode(), host: c.id, players: new Map() }; rooms.set(r.code, r); return join(c, r); }
     const r = rooms.get(String(m.code || '').toUpperCase().trim());
     if (!r) return send(c, { t: 'err', m: 'Sala não encontrada.' });
@@ -74,6 +106,10 @@ function handle(c, m) {
   if (m.t === 'ev') return bcast(c.room, { t: 'ev', id: c.id, k: m.k, d: m.d }, c); // eventos genéricos (fase 2)
   if (m.t === 'leave') leave(c);
 }
-// remove conexões mortas
-setInterval(() => rooms.forEach(r => r.players.forEach(p => { if (p.sock.destroyed) leave(p); })), 30000);
+// a cada 10 s: avisa que o servidor está vivo (heartbeat) e derruba conexões mudas
+setInterval(() => rooms.forEach(r => r.players.forEach(p => {
+  if (p.sock.destroyed) return;
+  if (p.rc && Date.now() - p.last > IDLE) return p.sock.destroy();
+  send(p, { t: 'p' });
+})), 10000);
 srv.listen(PORT, () => console.log('Comanda13 server na porta ' + PORT));
